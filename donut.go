@@ -4,88 +4,173 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"syscall"
+	"time"
+	"unsafe"
 )
 
-const (
-	TERM_WIDTH  = 80
-	TERM_HEIGHT = 22
-)
+const frame_delay = 33 // ie, 30 fps
+const theta_spacing = 0.07
+const phi_spacing = 0.02
 
-// N > 0 ? N : 0
-// b[o] = ".,-~:;=!*#$@"[N > 0 ? N : 0];
-func greaterThanN(N float64) int {
-	if N > 0 {
-		return int(math.Round(N))
-	}
-	return 0
+const R1 = 1.0
+const R2 = 2.0
+const K2 = 5.0
+
+type Screen struct {
+	dim  int
+	data [][]byte
 }
 
-// k % TERM_WIDTH ? ((char*) b)[k] : '\n'
-func rewrite(k, term_width int, b [TERM_HEIGHT][TERM_WIDTH]rune) [TERM_WIDTH]rune {
-	if math.Mod(float64(k), float64(term_width)) == 0 {
-		return b[k]
+func newZBuffer(d int) *[][]float64 {
+	b := make([][]float64, d)
+	for i := range b {
+		b[i] = make([]float64, d)
 	}
-
-	return b['\n']
+	return &b
 }
 
-func populateByte(b [TERM_HEIGHT][TERM_WIDTH]rune) {
-	for i := 0; i < TERM_HEIGHT; i++ {
-		for j := 0; j < TERM_WIDTH; j++ {
-			b[i][j] = ' '
+func newScreen(d int) *Screen {
+	b := make([][]byte, d)
+	for i := range b {
+		b[i] = make([]byte, d)
+	}
+	return &Screen{d, b}
+}
+
+func (screen Screen) render(time time.Time) {
+	fmt.Printf("\x1b[H") // bring cursor to "home" location
+	for j := 0; j < screen.dim; j++ {
+		fmt.Printf("%s\n", screen.data[j])
+	}
+}
+
+func (screen *Screen) clear() {
+	for i := range screen.data {
+		for j := range screen.data[i] {
+			screen.data[i][j] = ' '
 		}
 	}
 }
 
-func populateFloat(z [TERM_HEIGHT][TERM_WIDTH]float64) {
-	for i := 0; i < TERM_HEIGHT; i++ {
-		for j := 0; j < TERM_WIDTH; j++ {
-			z[i][j] = 0
+func (screen *Screen) computeFrame(A, B, K1 float64) {
+
+	// precompute sines and cosines of A and B
+	cosA := math.Cos(A)
+	sinA := math.Sin(A)
+	cosB := math.Cos(B)
+	sinB := math.Sin(B)
+
+	screen.clear()
+	zbuffer := newZBuffer(screen.dim)
+
+	// theta goes around the cross-sectional circle of a torus
+	for theta := 0.0; theta < 2.0*math.Pi; theta += theta_spacing {
+		// precompute sines and cosines of theta
+		costheta := math.Cos(theta)
+		sintheta := math.Sin(theta)
+
+		// phi goes around the center of revolution of a torus
+		for phi := 0.0; phi < 2.0*math.Pi; phi += phi_spacing {
+			// precompute sines and cosines of phi
+			cosphi := math.Cos(phi)
+			sinphi := math.Sin(phi)
+
+			// the x,y coordinate of the circle, before revolving (factored out of the above equations)
+			circlex := R2 + R1*costheta
+			circley := R1 * sintheta
+
+			// final 3D (x,y,z) coordinate after rotations, directly from our math above
+			x := circlex*(cosB*cosphi+sinA*sinB*sinphi) - circley*cosA*sinB
+			y := circlex*(sinB*cosphi-sinA*cosB*sinphi) + circley*cosA*cosB
+			z := K2 + cosA*circlex*sinphi + circley*sinA
+			ooz := 1 / z // "one over z"
+
+			// x and y projection.  note that y is negated here, because y goes up in
+			// 3D space but down on 2D displays.
+			xp := int(float64(screen.dim)/2.0 + K1*ooz*x)
+			yp := int(float64(screen.dim)/2.0 - K1*ooz*y)
+
+			// calculate luminance.  ugly, but correct.
+			L := cosphi*costheta*sinB - cosA*costheta*sinphi - sinA*sintheta +
+				cosB*(cosA*sintheta-costheta*sinA*sinphi)
+			// L ranges from -sqrt(2) to +sqrt(2).  If it's < 0, the surface is
+			// pointing away from us, so we won't bother trying to plot it.
+			if L > 0 {
+				// test against the z-buffer.  larger 1/z means the pixel is closer to
+				// the viewer than what's already plotted.
+				if ooz > (*zbuffer)[yp][xp] {
+					(*zbuffer)[yp][xp] = ooz
+					luminance_index := int(L * 8.0) // this brings L into the range 0..11 (8*sqrt(2) = 11.3)
+					// now we lookup the character corresponding to the luminance and plot it in our output:
+					screen.data[yp][xp] = ".,-~:;=!*#$@"[luminance_index]
+				}
+			}
 		}
+	}
+}
+
+// return the min of two uint16 and convert to int
+func min(x, y uint16) int {
+	if x < y {
+		return int(x)
+	}
+	return int(y)
+}
+
+type winsize struct {
+	Row    uint16
+	Col    uint16
+	Xpixel uint16
+	Ypixel uint16
+}
+
+// adapted from:
+// https://www.darkcoding.net/software/pretty-command-line-console-output-on-unix-in-python-and-go-lang/
+func GetWinsize() (*winsize, error) {
+	ws := new(winsize)
+
+	r1, _, errno := syscall.Syscall(syscall.SYS_IOCTL,
+		uintptr(syscall.Stdin),
+		uintptr(syscall.TIOCGWINSZ),
+		uintptr(unsafe.Pointer(ws)),
+	)
+
+	if int(r1) == -1 {
+		return nil, os.NewSyscallError("GetWinsize", errno)
+	}
+	return ws, nil
+}
+
+func animate(screen *Screen) {
+	// Calculate K1 based on screen size: the maximum x-distance occurs roughly at
+	// the edge of the torus, which is at x=R1+R2, z=0.  we want that to be
+	// displaced 3/8ths of the width of the screen, which is 3/4th of the way from
+	// the center to the side of the screen.
+	// screen_width*3/8 = K1*(R1+R2)/(K2+0)
+	// screen_width*K2*3/(8*(R1+R2)) = K1
+	A, B, K1 := 1.0, 1.0, float64(screen.dim)*K2*3.0/(8.0*(R1+R2))
+
+	fmt.Println("\033[2J\033[;H") // clear the screen
+
+	c := time.Tick(frame_delay * time.Millisecond) // create timer channel
+	for now := range c {
+		A += 0.07
+		B += 0.03
+		screen.computeFrame(A, B, K1)
+		screen.render(now)
 	}
 }
 
 func main() {
-	var A float64 = 0
-	var B float64 = 0
-	var i, j float64
-	var k int
-	z := [TERM_HEIGHT][TERM_WIDTH]float64{}
-	b := [TERM_HEIGHT][TERM_WIDTH]rune{}
 
-	fmt.Printf("\x1b[2J")
-	for {
-		populateByte(b)
-		populateFloat(z)
-		for j = 0; 2*math.Pi > j; j += 0.07 {
-			for i = 0; 2*math.Pi > i; i += 0.02 {
-				c := math.Sin(i)
-				d := math.Cos(j)
-				e := math.Sin(A)
-				f := math.Sin(j)
-				g := math.Cos(A)
-				h := d + 2
-				D := 1 / (c*h*e + f*g + 5)
-				l := math.Cos(i)
-				m := math.Cos(B)
-				n := math.Sin(B)
-				t := c*h*g - f*e
-				x := int(40 + 30*D*(l*h*m-t*n))
-				y := int(12 + 15*D*(l*h*n+t*m))
-				// o := int(x + 80*y)
-				N := 8 * ((f*e-c*d*g)*m - c*d*e - f*g - l*d*n)
-				if TERM_HEIGHT > y && y > 0 && x > 0 && TERM_WIDTH > x && D > z[y][x] {
-					z[y][x] = D
-					// ".,-~:;=!*#$@"[ N > 0 ? N : 0 ]
-					b[y][x] = [12]rune{'.', ',', '-', '~', ':', ';', '=', '!', '*', '#', '$', '@'}[greaterThanN(N)]
-				}
-			}
-		}
-		fmt.Printf("\x1b[H")
-		for k = 0; k < 1761; k++ {
-			fmt.Fprintln(os.Stdout, rewrite(k, TERM_WIDTH, b))
-			A += 0.00004
-			B += 0.00002
-		}
+	ws, err := GetWinsize()
+	if err != nil {
+		fmt.Println("Error: Unable to read terminal size.")
+		os.Exit(0)
 	}
+
+	dim := min(ws.Row, ws.Col)
+	screen := newScreen(dim)
+	animate(screen)
 }
